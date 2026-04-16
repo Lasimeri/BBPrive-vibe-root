@@ -1,0 +1,552 @@
+# BB Priv Root Research — Session 3 Complete Log (2026-03-25/26)
+
+## Executive Summary
+
+Exhaustive software-only root attempt on BB Priv STV100-2 (Android 6.0.1, Sept 2017 patches, kernel 3.10.84, MSM8992, Adreno 418, GRSecurity). Found multiple real vulnerabilities including a 0-day. 95% of a full exploit chain built. Blocked by inability to determine physical address of user-controlled page.
+
+## Vulnerabilities Discovered
+
+### 0-Day: KGSL SMMU TLB Stale Entry Write-After-Free
+- **Class**: CWE-416 via CWE-672 (same class as CVE-2025-71089, CVSS 7.8)
+- **Mechanism**: `IOCTL_KGSL_SHAREDMEM_FREE` updates SMMU page tables but doesn't flush GPU TLB. GPU commands in-flight write through stale TLB to freed physical pages.
+- **Reliability**: 85% (17/20 pages get GPU-written data after mapping freed)
+- **Affected**: Adreno 418 on kernel 3.10.84. Likely all Adreno 4xx/3xx on 3.10-3.18.
+
+### GPU Global Memory Write to SMMU Registers
+- **Mechanism**: `CP_MEM_WRITE` from user IB can write to GPU addresses 0xF8000000+ which map to KGSL global allocations including SMMU context bank registers
+- **SMMU base**: Physical 0xFDB10000 (from MSM8992 DT). User ctx at 0xFDB18000, TTBR0 at +0x20
+- **Confirmed**: Writing to 0xF8000000 causes delayed GPU crash. Writing to 0xF8001000-0xF8009000 survives (memstore region). Writing NOPs to 0xF8001000 doesn't crash. Writing 0 to 0xF8008020/0xF8009020 causes delayed crash (consistent with TTBR0 zeroing).
+
+### GPU Snapshot Physical Address Leak
+- **Mechanism**: Submit invalid GPU opcode (0xFF) → CP hardware fault → IRQ → snapshot captured at `/sys/class/kgsl/kgsl-3d0/snapshot/dump`
+- **Content**: 4096 bytes including TTBR0 at snapshot offset 0x34
+- **TTBR0 values**: Boot 1: 0x87f8c000, Boot 2: 0x865e8000 (changes per boot, page-aligned)
+- **Trigger**: Invalid TYPE3 packet with opcode 0xFF, followed by 1s poll of snapshot dump
+
+### vmsplice Data Persistence Through KGSL Free
+- `vmsplice()` pins KGSL page via `get_user_pages` into pipe buffer
+- Data survives `IOCTL_KGSL_GPUMEM_FREE_ID` + `munmap`
+- Read from pipe returns original data (0xAABBCCDD confirmed)
+
+## Device Access Map
+
+| Device | Access | Notes |
+|--------|--------|-------|
+| `/dev/kgsl-3d0` | RW | Full GPU access, all ioctls work |
+| `/dev/binder` | RW | UAF present but unexploitable (GRSec slab) |
+| `/dev/ashmem` | RW | |
+| `/dev/adsprpc-smd` | RO | INVOKE works, MMAP hangs, INIT_CREATE EPERM |
+| `/dev/ion` | RO | Full alloc/share/mmap. No ION_IOC_PHYS. |
+| `/dev/input/event0-5` | RW | Input injection |
+
+## Failed Attack Vectors
+
+| Vector | Why It Failed |
+|--------|--------------|
+| CVE-2019-2215 (binder UAF) | GRSec slab randomization, 20K BPF spray attempts failed |
+| CVE-2016-8655 (af_packet) | No CAP_NET_RAW |
+| CVE-2017-1000112 (UDP UFO) | No user namespaces |
+| CVE-2016-2067 (GPU VDSO) | RO mapping check patched |
+| CVE-2016-5195 (DirtyCOW) | Patched |
+| KGSL perfcounter overflow (EDB-39504) | 64-bit: min_t(int) makes count negative, loop never fires |
+| ADSPRPC MMAP race (CVE-2018-3564) | MMAP hangs in DSP communication, never returns EPERM |
+| ADSPRPC INIT_CREATE (unsigned module) | EPERM |
+| GPU register reads (CP_REG_TO_MEM) | Protected mode blocks all except RBBM_STATUS |
+| GPU CP_SET_PROTECTED_MODE | Opcode 0x5F doesn't exist on A4xx |
+| CP_INDIRECT_BUFFER to global region | GPU crashes (branch rejected by protection) |
+| TYPE0 CP_PROTECT_CTRL from ringbuffer region | Protection is self-referential on A4xx |
+| ION page reclaim | ION zeros pages on reallocation |
+| Anonymous page reclaim | Kernel zeros all user-accessible pages |
+| /proc/self/pagemap | Denied (GRSecurity) |
+| /proc/iomem | Denied |
+| All procfs pointer leaks | GRSecurity masks with %pK |
+| sysfs heap pointer leak (Flanker) | Device uses DT register names, not heap addresses |
+| ION_IOC_PHYS | Not in kernel (tried ioctl 3, all ION_IOC_CUSTOM sub-cmds) |
+| GPU snapshot (soft reset) | ft_policy=0xC2 (SKIPCMD) → no snapshot on soft fault |
+| dmesg TTBR0 leak | dmesg completely inaccessible |
+
+## The 95% Exploit Chain
+
+```
+STEP 1: ✅ Allocate ION buffer, fill with ARM LPAE identity-map page table entries
+STEP 2: ✅ Get TTBR0 from GPU snapshot (trigger HW fault with invalid opcode)
+         TTBR0 = physical address of current GPU IOMMU page table
+STEP 3: ❌ Get physical address of our ION page (for fake page table)
+         BLOCKED: No pagemap, no ION_PHYS, no dmesg, no ATS register access
+STEP 4: ✅ Write PA of fake page table to TTBR0 via CP_MEM_WRITE to 0xF8008020
+STEP 5: ✅ GPU IOMMU now uses our identity-map page table (GPU VA = PA)
+STEP 6: ✅ CP_MEM_WRITE to GPU addr 0x01648238 → physical selinux_enforcing → write 0
+STEP 7: ✅ SELinux disabled → mount -o remount,rw /system → install su
+```
+
+## Key Kernel Addresses (from vmlinux.elf, no KASLR)
+
+```
+selinux_enforcing:    0xffffffc001648238 (phys: 0x01648238)
+selinux_enabled:      0xffffffc00164823c
+init_task:            0xffffffc0016237e0
+commit_creds:         0xffffffc00024ab90
+prepare_kernel_cred:  0xffffffc00024aefc
+swapper_pg_dir:       phys 0x000FD000 (kernel_base + 0x7D000)
+KGSL_IOMMU_GLOBAL_MEM_BASE: 0xF8000000
+SMMU physical base:   0xFDB10000
+User ctx TTBR0:       SMMU_base + 0x8020 (GPU addr 0xF8008020 or 0xF8009020)
+```
+
+## Related Work
+
+| Reference | Relationship |
+|-----------|-------------|
+| CVE-2025-71089 (IOMMU stale TLB, Jan 2026) | Same bug class, x86 SVA variant |
+| BU ICSG Paper (DATE 2024) | Academic framework for our bug class |
+| CVE-2023-21666 (Jann Horn, KGSL page pool) | vmsplice technique |
+| GPUAF (BlackHat 2024) | Full Qualcomm GPU exploitation methodology |
+| kilroy (robclark, 2014) | Original Adreno IOMMU TTBR0 overwrite |
+| PowerVR TLB-free-before-invalidation (P0) | Exact analog on different GPU |
+
+## Files on Device
+
+- `/data/local/tmp/gpu_test_fresh` — GPU health check
+- `/data/local/tmp/gpu_hw_fault` — HW fault trigger + snapshot reader
+- `/data/local/tmp/gpu_snapshot.bin` — Last captured snapshot
+
+## Files on Host
+
+- `/home/lasi/blackberry-priv/firmware-aao474/vmlinux.elf` — Full kernel with 105K symbols
+- `/home/lasi/blackberry-priv/tokenloader/` — Decompiled tokenloader APK
+- `/home/lasi/blackberry-priv/CVE-2016-2067/` — KGSL GPU DMA PoC (reference)
+- `/tmp/msm_kgsl.h` — KGSL header for cross-compilation
+- All test binaries in `/tmp/`
+
+## What Would Complete the Exploit
+
+1. **Physical address of user ION page** — any info leak giving PA of our buffer
+2. **SMMU ATS register** — if ATS1PR/PAR registers exist and are accessible, write GPU VA → read PA
+3. **CMA/carveout ION heap** — allocate from fixed-PA region
+4. **Kernel info leak CVE** — any CVE that reveals a single kernel/DMA physical address
+5. **Creative GPU page table walk** — read TTBR0 entries through a side channel
+
+
+## Late Session Updates
+
+### GPU Snapshot Successfully Triggered
+- Invalid GPU opcode (TYPE3, opcode 0xFF) → CP hardware fault → IRQ → 4096-byte snapshot
+- Snapshot offset 0x34 = TTBR0 physical address (confirmed: changes per boot)
+- Boot 1: TTBR0 = 0x87f8c000
+- Boot 2: TTBR0 = 0x865e8000
+- Offset 0x2C = 0x11e1a300 (static across boots, possibly context PA)
+
+### ATS Translation Attempt
+- Wrote ION page GPU VA (0xBF000000) to SMMU ATS1PR candidates (0xF8008800, 0xF8009800)
+- Triggered snapshot after ATS write
+- PAR register NOT captured in snapshot format — only TTBR0 appears
+- ATS approach FAILED (snapshot doesn't dump PAR)
+
+### ION Heap 22 / 27
+- Both support allocations up to 16MB
+- Pages zeroed on alloc (first dword = 0)
+- Unknown if CMA or system heap — no way to determine PA
+
+### Final Blockers Summary
+Every remaining path to get a physical address is blocked:
+1. `/proc/self/pagemap` — GRSecurity denies
+2. `ION_IOC_PHYS` — Not in kernel
+3. `ION_IOC_CUSTOM` — Only cache ops, no PHYS sub-cmd
+4. dmesg — Completely inaccessible
+5. sysfs pointers — DT register names, not heap addresses
+6. `/proc/timer_list` — All pointers masked by GRSecurity
+7. `/proc/vmallocinfo` — All pointers masked
+8. logcat kernel buffer — Empty
+9. SMMU ATS → PAR — Not captured in snapshot
+10. KGSL ioctls — All return GPU VA, never physaddr (RE confirmed memdesc+0x28 never copied to user)
+11. GPU snapshot — Only captures TTBR0 + a few registers, not page table entries or PARs
+
+### Theoretical Remaining Approaches (Untested)
+1. **Blind TTBR0 brute force**: Try writing random CMA-range PAs to TTBR0 one per boot (~100 attempts for reasonable coverage). If one matches our ION page → identity map loaded → root.
+2. **Page table self-mapping**: If the page table at TTBR0 has a self-referencing entry (maps its own physical page at a known GPU VA), we could walk the table from GPU space. Unlikely but theoretically possible.
+3. **DMA coherent allocation PA prediction**: First DMA alloc after boot from CMA pool is at CMA base. If we're the first KGSL user after boot, GPUMEM_ALLOC might land at a predictable PA.
+4. **Cache timing side-channel**: Allocate many pages, use GPU timing of CP_MEM_WRITE to infer cache set → narrow PA range. Very complex.
+
+
+## Final Testing (Late Session)
+
+### In-Place Page Table Modification: FAILED
+- Wrote LPAE L1[0] identity-map block descriptor (0x00000401) to EVERY page in 0xF8001000-0xF8009000
+- Wrote TLBIALL to both SMMU candidate addresses
+- Wrote 0 to GPU address 0x01648238 (selinux_enforcing physical)
+- GPU SURVIVED all writes (pre=0xAAAAAAAA, post=0xBBBBBBBB)
+- SELinux: **STILL ENFORCING** 
+- **Conclusion: IOMMU page table is NOT in GPU virtual address space.** SMMU walks page tables in physical memory. CP_MEM_WRITE cannot reach page table entries.
+
+### TTBR0 Overwrite Bruteforce: PARTIALLY WORKING
+- Writing candidate PA to SMMU TTBR0 at GPU addr 0xF8008020: GPU executes pre+post markers THEN crashes
+- This CONFIRMS the write IS effective — TTBR0 is being changed
+- But wrong PA (not our ION page) → invalid page table → GPU crash after 2-3 more commands
+- TTBR0 values across 3 boots: 0x87f8c000, 0x865e8000, 0x5d2dc000, 0x5ebbc000, 0x52130000 — RANDOM each boot
+
+### Definitive Final State
+The exploit chain is confirmed WORKING up to the PA-unknown step:
+1. ✅ Write to SMMU TTBR0 via CP_MEM_WRITE (GPU addr 0xF8008020)
+2. ✅ TTBR0 change takes effect (GPU uses new value for address translation)
+3. ✅ Identity-map LPAE L1 entries prepared in ION buffer
+4. ❌ Physical address of ION buffer unknown — EVERY info leak blocked by GRSecurity
+5. ❌ Page table not in GPU VA space — can't modify PTEs in-place
+
+The ONLY remaining path is knowing the PA of our ION page. Hardware EDL is the practical route.
+
+
+## MAJOR PROGRESS: CMA Identity Map Loads Successfully
+
+### Confirmed Working:
+- ION audio heap (id=28) allocation from CMA → PA = **0xCB800000** (first alloc from CMA pool)
+- ARMv7 short-descriptor L1 section identity map (4096 entries × 4B = 16KB)
+- Writing 0xCB800000 to SMMU TTBR0 at GPU addr 0xF8008020: **GPU SURVIVES**
+- Writing 0x00000000 to TTBR0: **GPU CRASHES** (control test)
+- Writing our PA to TTBR0 AND then writing to GPU addr 0x01648238: **ALL MARKERS LAND**
+- This means the identity map IS loaded and the GPU can address physical memory
+
+### Still Blocked:
+- `selinux_enforcing` remains 1 (Enforcing)
+- Most likely cause: **CPU cache coherency** — GPU DMA write updates physical RAM but CPU L1/L2 cache still holds old value
+- The CPU never invalidates its cache for this address, so it reads the cached value (1) not the RAM value (0)
+
+### Next Step:
+- Force CPU cache invalidation after GPU write
+- Or: write to a NON-CACHED kernel variable 
+- Or: write to the `selinux_enforcing` via a DIFFERENT mechanism that flushes cache (e.g., write to sysfs which triggers a kernel function that re-reads from memory)
+- Or: write to `init_task.cred` to change our UID instead (cred structure is frequently accessed, cache would be refreshed)
+
+---
+
+## Session 4 (2026-03-26): TTBR0 Overwrite DISPROVEN
+
+### Critical Finding: GPU Cannot Write to SMMU Registers
+
+**The entire TTBR0 overwrite approach is invalid.** Extensive empirical testing proved that CP_MEM_WRITE from user IBs cannot reach SMMU registers.
+
+#### Evidence: TTBR0 Probe with Fresh Buffers
+- Tested ALL candidate GPU VAs: 0xF8005020, 0xF8006020, 0xF8007020, 0xF8008020, 0xF8009020
+- Used FRESH (never GPU-accessed) KGSL buffers to bypass GPU microTLB caching
+- Result: **ALL candidates showed original page table still active**
+- Post-TTBR0-switch markers landed in KGSL buffers (meaning old translation was used)
+- Fresh buffers also received markers (no microTLB entry → SMMU walk → old page table)
+
+#### Root Cause Analysis
+1. **SMMU registers are on the AHB/APB control bus**, not the main data bus
+2. GPU DMA writes go: GPU → SMMU translation → PA → system bus → DRAM
+3. SMMU register MMIO is on a SEPARATE bus that requires CPU privilege
+4. The `kgsl_iommu_set_pt` function writes TTBR0 via **CPU `str` instruction** (confirmed at 0xffffffc00063f610), NOT GPU DMA
+5. GPU CP_SET_PROTECTED_MODE (opcode 0x5F) EXISTS on A4xx but only from ringbuffer level
+6. The kernel's context switch generates ringbuffer commands that use CP_SET_PROTECTED_MODE + direct register writes, NOT CP_MEM_WRITE to SMMU
+
+#### Why Previous "Confirmations" Were Wrong
+- "TTBR0=0 crashes GPU" → Actually corrupted memstore/ringbuffer data at 0xF8008020, not TTBR0
+- "TTBR0=CMA_PA survives, markers land" → CMA PA is a benign value for memstore; markers used OLD page table via GPU microTLB or SMMU TLB cache
+- "Identity map loaded" → Never was. The selinux write went to unmapped GPU VA (0x01648238 is below user region), silently dropped by SMMU fault handler
+- Cache coherency was never the blocker — the GPU write to selinux_enforcing never reached DRAM at all
+
+### What The Global Region (0xF8000000+) Actually Contains
+```
+0xF8000000-0xF8009FFF: KGSL data structures only (memstore, scratch, ringbuffer)
+                       NOT SMMU registers, NOT page tables
+0xF800A000+:           Unmapped (IOMMU fault)
+```
+
+SMMU context bank registers (physical 0xFDB18000+) are mapped into KERNEL virtual address space for CPU access, but are **NOT mapped into the GPU virtual address space** for DMA access. The global PT entries only contain KGSL-internal allocations.
+
+### KGSL GPUMEM_GET_INFO — No PA Leak
+Disassembly confirmed fields returned to userspace:
+- gpuaddr (GPU VA)
+- id (mem entry ID)
+- flags
+- size / mmapsize
+- useraddr (userspace VA)
+Physical address (memdesc+0x28) is **never** copied to userspace.
+
+### Updated Failed Vectors Table
+| Vector | Why It Failed |
+|--------|--------------|
+| GPU SMMU TTBR0 overwrite (0xF8008020) | SMMU registers on AHB/APB bus, not DMA-accessible from GPU |
+| GPU identity map via CMA | TTBR0 never changed; writes to low GPU VAs silently dropped (SMMU fault) |
+| Cache flooding for selinux_enforcing | Moot — GPU write never reached DRAM in the first place |
+
+### Remaining Confirmed Primitives
+1. **GPU CP_MEM_WRITE to global data region** (0xF8000000-0xF8009FFF) — can corrupt memstore/scratch/ringbuffer
+2. **Stale TLB 0-day** (85% reliable) — GPU writes through cached TLB to freed physical pages
+3. **GPU snapshot TTBR0 leak** — get IOMMU page table physical address from snapshot
+4. **ION CMA allocation** — predictable physical address (first alloc from audio heap at ~0xCB800000)
+5. **vmsplice page pinning** — prevent freed KGSL pages from being reclaimed
+
+### Key Offsets Extracted from vmlinux.elf
+```
+thread_info->addr_limit: offset 8  (8 bytes, KERNEL_DS = 0xFFFFFFFFFFFFFFFF)
+thread_info->task:       offset 16
+task_struct->real_cred:  offset 0x868 (2152)
+task_struct->cred:       offset 0x8C8 (2248)
+struct cred->uid:        offset 4 (no DEBUG_CREDENTIALS)
+struct cred->euid:       offset 20
+struct cred->fsuid:      offset 28
+struct cred->fsgid:      offset 32
+struct cred size:        0xD0 (208 bytes)
+init_cred:               VA 0xffffffc00162c750, PA 0x0162c750
+```
+
+### Next Steps (Session 4+)
+1. **Stale TLB + heap grooming** — Free KGSL pages, spray kernel allocations (pipe buffers, thread stacks), GPU writes through stale TLB to corrupt addr_limit or cred
+2. **Search for unpatched CVEs** — CVE-2016-5340 (ION overflow), IPA driver, IPC router
+3. **Find kernel source** — github.com/nicknumb repos all 404; need correct URL
+4. **Hardware EDL** as reliable fallback
+
+## Session 4 Breakthrough: CVE-2019-2215 iovec Spray WORKS
+
+### Binder UAF + iovec Spray Bypasses GRSecurity
+
+**The iovec spray technique successfully fills the freed binder_thread slot despite GRSecurity slab randomization.**
+
+- binder_thread = 296 bytes → kmalloc-512
+- iovec[32] = 32 × 16 = 512 bytes → kmalloc-512 (same cache!)
+- 400 iovec arrays sprayed (200 pre-free + 200 post-free) via blocking `readv()` on pipes
+- `epoll_wait` returned 1 event → corrupted wait_queue was traversed → spray landed
+- Kernel survived the walk → no immediate crash
+- GRSecurity's SLAB randomization makes spray SLOWER but not impossible with 400+ objects
+- BPF spray failed at 20K attempts because BPF arrays are in a DIFFERENT slab cache!
+
+### Key Finding: BPF vs iovec Slab Mismatch
+Previous BPF spray used `sendmsg` + BPF_MAP_LOOKUP_ELEM which allocates from different slab caches than kmalloc-512. The iovec spray uses `readv()` which allocates from kmalloc-512 directly — matching binder_thread's cache.
+
+### Kernel Source Found
+- Repo: `BBAndroids/android_kernel_blackberry_msm8992` (LineageOS adaptation, 3.10.108)
+- Cloned to `/home/lasi/blackberry-priv/kernel-source/`
+- binder_thread struct at `drivers/android/binder.c:382`
+- CVE-2019-2215 UAF confirmed present (no POLLFREE fix)
+- CVE-2017-0564 ION race: FIXED in this source (`_nolock` variants with mutex held)
+- All QuadRooter CVEs: FIXED
+
+### BLOCKER: CONFIG_DEBUG_LIST Kills iovec Exploitation
+
+**CONFIG_DEBUG_LIST is ENABLED and FATAL** on this kernel. Disassembly of `__list_del_entry_debug` (0xffffffc00049a2d0) shows:
+- Validates `entry->prev->next == entry` and `entry->next->prev == entry`
+- ALL failure paths end with `BUG()` (instruction `0xe7f001f2` = undefined → kernel panic)
+- The `list_del` that would corrupt iovec[5] with kernel address K will BUG because our iovec data doesn't satisfy the validation
+
+**Phase 1 survived because**: `wait_for_proc_work = true` → epoll entry in `proc->wait` → closing binder queues DEFERRED release → by the time epoll_wait runs, the deferred work hasn't executed yet → no UAF triggered → no list_del on corrupted data.
+
+**Status**: CVE-2019-2215 iovec technique is DEAD on this kernel. The `CONFIG_DEBUG_LIST` validation prevents the list pointer corruption that is the foundation of the exploit.
+
+### Updated Final Vector Summary
+
+| Vector | Status |
+|--------|--------|
+| CVE-2019-2215 + iovec spray | DEAD — CONFIG_DEBUG_LIST BUGs on corrupted list_del |
+| CVE-2019-2215 + BPF spray | DEAD — GRSec slab randomization + wrong slab cache |
+| GPU SMMU TTBR0 overwrite | DEAD — SMMU registers not GPU DMA-accessible |
+| GPU stale TLB 0-day | WORKS (85%) but no way to redirect write to useful target |
+| ION CMA at known PA | WORKS but no primitive to write to arbitrary PA |
+| GPU snapshot TTBR0 leak | WORKS but no write primitive |
+| All kernel CVEs checked | ALL PATCHED (QuadRooter, ION races, IPA, IPC router) |
+
+### Remaining Theoretical Paths
+1. ~~**Stale TLB + page-level heap grooming**~~ — **DEAD**: writing to freed GPU VA causes IOMMU fault → GPU reset. Stale TLB only works when page is pinned (vmsplice), preventing kernel reuse.
+2. **EDL via hardware** — order USB cable, use firehose to dump/flash boot partition — **ONLY VIABLE PATH**
+3. **Tokenloader secret code** — `*#*#43886536#*#*` but requires active BB infrastructure (server: stmtoken.services.blackberry.com, likely dead)
+4. ~~**New 0-day in KGSL**~~ — would need a bug that doesn't involve list operations AND doesn't require writing to freed pages
+
+### Session 4 Deep-Dive: Stale TLB Limitations
+
+**PAX_MEMORY_SANITIZE is NOT compiled in** — confirmed via kernel source and binary (no symbols, no hooks in mm/page_alloc.c). Freed pages retain data.
+
+**However, the stale TLB write to freed pages CRASHES the GPU:**
+- When KGSL frees a buffer, it removes the IOMMU PTE
+- Stale GPU TLB can still translate for a short window
+- But the SMMU eventually detects the invalid PTE (on TLB miss or hardware validation)
+- IOMMU fault fires → `ft_pagefault_policy` → GPU reset
+- GPU becomes unresponsive, all subsequent commands fail
+
+**Stale TLB only works reliably when the page is PINNED:**
+- vmsplice pins the page (refcount > 0)
+- KGSL frees the IOMMU mapping (PTE removed) but page stays in memory
+- GPU writes through stale TLB to the still-present physical page
+- The 85% success rate from Session 3 was specifically with pinned pages
+
+**This means:** The stale TLB primitive gives GPU→pipe data channel (read from pipe after GPU writes to pinned page), but the page can't be freed to buddy and reused for kernel objects. No cross-cache exploitation possible.
+
+### Definitive Assessment: Software Root is Not Achievable
+
+Every kernel-level software exploitation path has been exhausted:
+
+| Category | Technique | Blocker |
+|----------|-----------|---------|
+| GPU | SMMU TTBR0 overwrite | SMMU registers not DMA-accessible |
+| GPU | Stale TLB → freed page | IOMMU fault → GPU crash |
+| GPU | Stale TLB → pinned page | Page can't be reused by kernel |
+| GPU | Global memory write | Only reaches memstore/scratch, not registers |
+| Binder | CVE-2019-2215 list corruption | CONFIG_DEBUG_LIST → BUG() |
+| Binder | CVE-2019-2215 BPF spray | Wrong slab cache |
+| ION | CVE-2017-0564 race | Fixed (mutex held throughout) |
+| ION | ION_IOC_PHYS | Not in kernel |
+| Qualcomm | All 2016-2017 CVEs | Patched (QuadRooter, IPA, IPC, crypto) |
+| Kernel | DirtyCOW, pipe, af_packet | Patched or no capabilities |
+| Procfs | All PA leak paths | GRSecurity blocks everything |
+
+**The $1,000 XDA bounty was correct: no one rooted the BB Priv via software. The GRSecurity + CONFIG_DEBUG_LIST + aggressive patching combination is unbreakable from ADB shell on this firmware.**
+
+**Hardware EDL remains the only viable path to root** — unless the ION cache invalidation breakthrough below leads somewhere.
+
+## Session 4 Late Breakthrough: GPU DMA → ION Cache Invalidation Pipeline
+
+### Confirmed: GPU DMA Writes Visible to CPU via ION Cache Sync
+
+**The cache coherency problem is SOLVED for ION-backed buffers.**
+
+Test: Allocate ION CMA buffer (heap 28, `ION_FLAG_CACHED=1`), map to GPU via `IOCTL_KGSL_MAP_USER_MEM`, GPU writes 0xAA000000 via CP_MEM_WRITE, then `ION_IOC_INV_CACHES` (ioctl 6, sub-cmd 1) with the ION buffer's userspace vaddr → **CPU reads 0xAA000000. GPU DMA write is visible.**
+
+```
+ION CMA alloc (heap 28, cached) → PA ~0xCB800000
+MAP_USER_MEM → GPU VA 0xBF000000
+GPU CP_MEM_WRITE → 0xAA000000 to GPU VA → DRAM updated (non-coherent)
+ION_IOC_INV_CACHES (vaddr=ion_buf, len=0x1000) → dmac_inv_range → CPU cache invalidated
+CPU read → fetches from DRAM → sees 0xAA000000 ✓
+```
+
+### Key Components
+- `ION_FLAG_CACHED` (flags=1) is REQUIRED — without it, `ion_do_cache_op` returns early (`!ION_IS_CACHED`)
+- ION cache invalidation calls `dmac_inv_range(vaddr, vaddr+length)` → ARM64 `dc ivac` on each cache line
+- This works for ANY ION buffer mapped to both CPU and GPU
+- The `check_vaddr_bounds` function has a NULL bypass (line 729: `if (start && check_vaddr_bounds(...))`), but the normal path with valid vaddr also works
+
+### Why This Matters
+Previously, ALL GPU DMA writes were invisible to the CPU due to cache coherency. This blocked:
+- Writing 0 to selinux_enforcing via GPU (CPU never saw the DRAM update)
+- All GPU-based kernel memory modification
+
+Now we have: GPU write → ION cache inv → CPU sees it. BUT only for ION-allocated pages (not arbitrary physical addresses like selinux_enforcing at PA 0x01648238).
+
+### Remaining Gap
+- ION CMA is at PA ~0xCB800000
+- selinux_enforcing is at PA 0x01648238
+- ION cache inv only invalidates ION buffer pages, not arbitrary kernel addresses
+- Need a way to either:
+  1. Get an ION buffer at PA 0x01648000 (selinux page) — impossible, CMA region is fixed
+  2. Use the ION vaddr=NULL bypass to flush selinux's cache line — need to verify
+  3. Use a different cache invalidation trigger that covers selinux's address
+
+### Also Confirmed This Session
+- GPU microTLB survives SMMU TLBIALL (15/15 batch completions in stale TLB race test)
+- PAX_MEMORY_SANITIZE is NOT compiled in (freed pages retain data)
+- KGSL zeroes pages on allocation (memset + dcache flush), destroying stale data
+- All userspace-accessible allocation paths zero pages (mmap, KGSL, page cache)
+- SLUB slab pages are NOT zeroed (only freelist pointers written) — potential for cross-cache
+- SMMU TTBR0 is NOT at ANY address in 0xF8000000-0xF8009FFF (tested all 10 pages at offset +0x20)
+- SMMU registers confirmed NOT GPU-accessible (definitively, all candidates exhausted)
+- GPU DMA → ION WRITECOMBINE mmap is immediately visible to CPU (no cache sync needed)
+- ION_IOC_INV_CACHES uses dma_sync_sg_for_cpu → invalidates via kernel linear map → correct physical cache lines
+- ION cache inv ONLY works on pages in the ION buffer's own scatterlist (can't target arbitrary PA)
+- KGSL MAP_USER_MEM strips cache mode flags (line 3186-3187: "CACHEMODE is ignored for this call")
+- ION cache inv vaddr mismatch: vaddr not validated against handle → can flush ANY userspace VMA's cache lines
+- No ION heap on MSM8992 can allocate at PA 0x01648000 (kernel .data region)
+
+## Session 4 Final: Exhaustive Closure
+
+### 14 Approaches Analyzed — All Dead
+
+| # | Approach | Why Dead |
+|---|---------|----------|
+| 1 | SMMU TTBR0 overwrite (0xF8000020-0xF8009020) | SMMU regs NOT in GPU VA space (tested ALL 10 pages) |
+| 2 | CMA identity map via TTBR0 | TTBR0 never changed; identity map never loaded |
+| 3 | GPU VA 0x01648238 direct write | Unmapped in IOMMU, silent fault drop |
+| 4 | Stale TLB → freed page → slab reuse | IOMMU fault crashes GPU (without pinning); KGSL zeroes on realloc |
+| 5 | CVE-2019-2215 + iovec list corruption | CONFIG_DEBUG_LIST → BUG() on corrupted list_del |
+| 6 | CVE-2019-2215 + BPF spray | Wrong slab cache + GRSec randomization |
+| 7 | GPU page table walk via snapshot + PTE mod | IOMMU PT not in GPU VA space; TTBR0 PA not in CMA range |
+| 8 | Cross-cache stale TLB → kernel slab | CMA pages stay in CMA pool, not recycled to slab |
+| 9 | ION cache inv → flush selinux cache line | ION cache ops only cover ION buffer's OWN pages |
+| 10 | Forge fake ion_buffer with custom phys_addr | Can't write to kernel slab (ion_buffer) from GPU |
+| 11 | Large ION CMA alloc spanning selinux PA | CMA at 0xCB800000, selinux at 0x01648238 — different regions |
+| 12 | MAP_USER_MEM + ION buffer corruption | Same CMA PA limitation |
+| 13 | Target cred struct via system heap TLB | System heap pages go to ION pool, not buddy; GPU crash on free |
+| 14 | addr_limit via pipe_buffer + stale TLB | Pipe DATA page != pipe_buffer metadata; can modify content only |
+
+### What DOES Work (Confirmed)
+- GPU → ION CMA (WRITECOMBINE) → CPU read: **immediate visibility, no cache sync needed**
+- ION_IOC_INV_CACHES with vaddr mismatch: **can flush any userspace VMA page** (vaddr not validated against handle)
+- GPU microTLB survives SMMU TLBIALL: **15/15 success**
+- Stale TLB write to pinned page: **~85% reliable**
+- All kernel addresses known (no KASLR), full vmlinux.elf with 105K symbols
+
+### Why Software Root is Impossible
+The fundamental gap: **no way to create a GPU IOMMU mapping to kernel .data physical addresses.** Every IOMMU mapping is controlled by the KGSL driver, which only maps:
+- KGSL-allocated pages (buddy allocator, random PAs)
+- ION-backed pages (CMA or system heap, fixed/random PAs)
+- User pages via MAP_USER_MEM (get_user_pages on user VMAs)
+
+None of these can target PA 0x01648238 (selinux_enforcing). The SMMU registers are on the AHB/APB bus, inaccessible from GPU DMA. CONFIG_DEBUG_LIST blocks the only kernel UAF with known exploit technique.
+
+### Session 4 Final Attempts
+
+**GPU CMA Kernel VA scaffold**: Confirmed CMA buffer at kernel VA 0xffffffc0CB800000 is writable via GPU and readable from CPU (writecombine mmap). Filled with RET gadgets for safe function pointer redirection. ✓
+
+**Binder wake_up bypass**: CONFIG_DEBUG_LIST blocks list_del but NOT list traversal (wake_up). However, binder_lock serializes all wake_up calls with binder_deferred_release. Cannot race wake_up after proc free. ✗
+
+**Cross-cache slab attack (50 attempts)**: GPU stale TLB writes CMA_KERNEL_VA to every 8-byte offset in freed KGSL page. Socket spray to reclaim page as slab. Kernel survived all 50 attempts — `kzalloc` zeroes all objects, destroying GPU data. ✗
+
+**Debugfs accessible**: `/sys/kernel/debug/` is readable (tracing, ion, kgsl, ipa). ftrace `trace` file is writable by shell group. But `set_event` and `current_tracer` are root-only → can't enable trace events. ✗
+
+**Attack surface summary**: No setuid binaries. No world-writable system dirs. `/persist`, `/cache` not writable from shell. All sysctls read-only. BIDE content provider throws NPE (potential surface but not exploitable for root).
+
+### Hardware EDL is the Only Path
+Order deep-flash USB cable, enter EDL mode, dump/patch boot partition via firehose.
+
+## Session 4 Extended: System Heap + Stale TLB Chain
+
+### Key Pivot: ION System Heap (id=25) Instead of CMA
+
+Agent research identified the critical insight: **system heap pages return to buddy on free, unlike CMA pages which stay in the CMA pool.** This means freed KGSL system heap pages CAN be reclaimed by SLUB for slab objects.
+
+### Confirmed Working:
+- ION system heap alloc + MAP_USER_MEM to KGSL → GPU VA 0xBF000000 ✓
+- GPU stale TLB write through system heap page → GPU OK (at least on first attempt) ✓
+- CMA buffer at kernel VA 0xffffffc0CB800000 filled with RET gadgets as fake vtable ✓
+- Pipe spray (200 pipes + close) didn't crash kernel → no function pointer hit yet ✓
+
+### The Chain (if slab reuse works):
+1. ION system heap alloc → page P from buddy allocator (random PA)
+2. MAP_USER_MEM → KGSL maps page P to GPU VA G
+3. GPU warms microTLB for G → page P
+4. Free ION buffer + KGSL mapping → page P returns to buddy
+5. GPU stale TLB writes CMA_KERNEL_VA (0xffffffc0CB800000) at every 8-byte offset of page P
+6. SLUB reclaims page P for a slab cache (e.g., kmalloc-1024 used by pipe_buffer arrays)
+7. pipe() allocates pipe_buffer array from this slab page → pipe_buffer.ops = CMA_KERNEL_VA (our data!)
+8. close(pipe) → kernel calls ops->release → jumps to CMA_KERNEL_VA → our fake vtable
+9. Fake vtable has RET gadgets (safe for now) or ROP chain (for actual exploitation)
+
+### Remaining Blockers:
+- `kzalloc` zeroes pipe_buffer arrays → destroys our GPU data in the slab
+- Need to find a kernel object using `kmalloc` (not kzalloc) with function pointer at offset ≥ 8
+- GPU crashes on second attempt (microTLB expires between iterations)
+- Heap grooming not aggressive enough — page P stays in PCP, not reclaimed by SLUB
+
+### SELinux Policy Dumped
+- Policy at `/sys/fs/selinux/policy` (294KB) readable and pulled
+- Shell domain has access to: gpu_device, ion_device, binder_device, debugfs, selinuxfs
+- Need proper setools to fully decompile allowed operations
+
+### New Attack Surfaces Discovered
+- Debugfs fully accessible (tracing, ion, kgsl, ipa, binder, dma_buf)
+- ftrace buffer_size_kb writable (can allocate/free up to 64MB of kernel pages)
+- trace_marker world-writable
+- Groups: token_service_native_consumer, mfg_client — BB-specific, minimal extra access
+- DIAG status leaks kernel pointers (0xffffffc0... addresses visible)
+- install_non_market_apps=1 (APK sideloading enabled, F-Droid installed)
+- SysV IPC (msgget/semget/shmget) NOT compiled in — msg_msg spray unavailable
+- No keyctl binary but syscall may work from C
+- sendmsg ancillary data kmalloc is available spray primitive
+- setxattr/fsetxattr syscall available for kmalloc spray (45 xattrs before limit)
+- struct sk_filter has bpf_func at offset 8 (allocated via kmalloc) — but initialized before use
+- All KGSL/ION driver allocations use kzalloc (zeroed)
+- SysV IPC not compiled — no msg_msg spray
+- add_key blocked by SELinux
+- kgsl_fence_event_priv: kmalloc but no function pointers (16 bytes only)
+- add_key() syscall for key payload kmalloc spray (user keyring)
+- SELinux policy dumped to /tmp/sepolicy (294KB, needs setools to decompile)
+- selinuxfs access/context/create/member are world-writable (query interface only)
+- KGSL profiling enable not writable by shell
