@@ -51,3 +51,4 @@ The SMMU register bank (physical 0xFDB10000+) sits on the MSM AHB/APB control bu
 ## License and use
 
 Research documentation. Not a root tool. Do not run against devices you do not own.
+- **`docs/2026-04-17-flash-attempts-and-cve-2021-1961.md`** — AAF153 downgrade attempt (blocked by fuse-bound sigtag), AAW068 cross-variant attempt (same block), `erase bootsig` discovery, CVE-2021-1961 identified as the remaining unpatched TrustZone attack surface. Both Exa and Sonnet research agents independently converged on CVE-2021-1961 as the top viable path.
