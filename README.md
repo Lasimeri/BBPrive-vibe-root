@@ -27,6 +27,8 @@ The device is personally owned and research is conducted on it directly; no othe
 
 - **`Initial Progress: Opus 4.6`** — Session 3/4 complete research log. 14 attack vectors explored, including the KGSL SMMU stale-TLB 0-day, CVE-2019-2215 iovec spray (dead on 3.10 + DEBUG_LIST), and the GPU IOMMU identity-map chain. Ends with "hardware EDL is the only path." Superseded by the 2026-04-16 PA-leak below.
 - **`docs/2026-04-16-ion-debugfs-pa-leak.md`** — New finding: `/sys/kernel/debug/ion/heaps/<heap>` dumps raw `phys_addr_t` via `%pa`, which bypasses `kptr_restrict`. Shell-readable. Resolves the chain's primary blocker. Candidate for a standalone CVE.
+- **`docs/2026-04-16-cve-2017-8890-port-plan.md`** — Porting plan for CVE-2017-8890 (IGMP double-free) from Nexus 6P to Priv. Port built and executed — mechanically correct, blocked at runtime by `sysctl_igmp_max_memberships` × GRSec AUTOSLAB.
+- **`docs/2026-04-17-bb-secure-boot-chain-and-edl-path.md`** — Full analysis of the BB Priv secure-boot chain (PBL→SBL-1→aboot→bootsig→boot.img→dm-verity), the `authboot`/`pcauthtool`/`aveflash.lua` internal toolkit, cross-variant flash mechanics, why software root is exhausted on this firmware, and the EDL/firehose plan for the next session.
 
 ## Primitives confirmed on the device
 
